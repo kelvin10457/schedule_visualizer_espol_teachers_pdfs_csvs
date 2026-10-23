@@ -1,0 +1,9 @@
+# Netlify debe compilar la app (TypeScript + Vite) y publicar solo dist/. Sin esto publica
+# los archivos fuente y la página queda en blanco, porque index.html apunta a src/main.tsx.
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  # Vite 8 requiere Node 20.19+ o 22.12+.
+  NODE_VERSION = "22"
