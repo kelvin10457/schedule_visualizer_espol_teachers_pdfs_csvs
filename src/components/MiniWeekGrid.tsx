@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Subject from "../models/Subject";
 import { tooltipPosition } from "../lib/tooltip";
+import { tipoLabel } from "../lib/parseReport";
 import { badgeStyle, CONFLICT_COLOR, quincenaHatch, type BlockColor } from "../lib/palette";
 
 export interface WeekBlock {
@@ -28,8 +29,8 @@ export interface FreeBlockInput {
 
 const FREE_KIND_STYLE: Record<FreeKind, { bg: string; border: string; label: string }> = {
     TODAS: { bg: "rgba(30,122,76,0.08)", border: "rgba(30,122,76,0.45)", label: "Libre todas las semanas" },
-    "1": { bg: "rgba(154,101,18,0.09)", border: "rgba(154,101,18,0.45)", label: "Libre en 1ª quincena" },
-    "2": { bg: "rgba(101,71,154,0.09)", border: "rgba(101,71,154,0.45)", label: "Libre en 2ª quincena" },
+    "1": { bg: "rgba(154,101,18,0.09)", border: "rgba(154,101,18,0.45)", label: "Libre solo en semanas impares" },
+    "2": { bg: "rgba(101,71,154,0.09)", border: "rgba(101,71,154,0.45)", label: "Libre solo en semanas pares" },
 };
 
 function fmtTime(m: number): string {
@@ -38,20 +39,15 @@ function fmtTime(m: number): string {
 
 function blockTooltipRows(b: WeekBlock): [string, string | number][] {
     const s = b.subject;
-    const pq = s.planificada_quincenalmente?.trim().toUpperCase() ?? "";
     const rows: [string, string | number][] = [
         ["Código", s.codigo_materia],
-        ["Tipo", s.tipo],
+        ["Tipo", tipoLabel(s)],
         ["Paralelo", s.paralelo],
         ["Profesor", s.profesor],
         ["Horario", `${fmtTime(b.startMin)} – ${fmtTime(b.endMin)}`],
-        ["Aula", `${s.aula} · ${s.bloque}`],
-        ["Cupo", `${s.cupo_disponible} / ${s.cupo_maximo}`],
-        ["Nivel", s.nivel],
+        ["Aula", [s.aula, s.bloque].filter(Boolean).join(" · ")],
+        ["Nivel", s.nivel || "Otra carrera"],
     ];
-    if (pq === "1 QUINCENA" || pq === "2 QUINCENA") {
-        rows.push(["Quincena", pq === "1 QUINCENA" ? "1ª Quincena" : "2ª Quincena"]);
-    }
     return rows;
 }
 
@@ -373,7 +369,7 @@ export default function MiniWeekGrid({ blocks, freeBlocks }: MiniWeekGridProps) 
                                                         ...badgeStyle(isTEORIA, quincena),
                                                     }}
                                                 >
-                                                    {isTEORIA ? "TEO" : quincena ? `PRA · Q${quincena}` : "PRA"}
+                                                    {isTEORIA ? "TEO" : quincena === 1 ? "PRA · IMPAR" : quincena === 2 ? "PRA · PAR" : "PRA"}
                                                 </span>
                                             )}
                                         </div>
@@ -434,7 +430,7 @@ export default function MiniWeekGrid({ blocks, freeBlocks }: MiniWeekGridProps) 
                                         "Detalle",
                                         tooltip.free.freeIn === "TODAS"
                                             ? "Ninguna clase del nivel en esta franja"
-                                            : `Solo hay clases de la ${tooltip.free.freeIn === "1" ? "2ª" : "1ª"} quincena`,
+                                            : `Solo hay clases de semanas ${tooltip.free.freeIn === "1" ? "pares" : "impares"}`,
                                     ],
                                 ]}
                             />

@@ -121,6 +121,9 @@ body {
   height: 40px;
   font-size: 14px;
 }
+.btn-badge-warning {
+  background: var(--q1) !important;
+}
 .btn-badge {
   min-width: 18px;
   height: 18px;
@@ -212,6 +215,11 @@ select.input.is-danger {
   background: var(--danger-soft);
   border-color: var(--danger-border);
   color: #7a1a12;
+}
+.callout-warning {
+  background: var(--q1-soft);
+  border-color: var(--q1-border);
+  color: var(--text);
 }
 .callout-info {
   background: var(--accent-soft);

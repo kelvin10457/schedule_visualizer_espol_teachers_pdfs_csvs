@@ -2,87 +2,24 @@ import { useEffect, useState, useMemo } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import Subject from "../models/Subject";
 import { getStorageItem, setStorageItem } from "../lib/storage";
-import SearchableSelect from "../components/SearchableSelect";
+import FilterSelect from "../components/FilterSelect";
 import { timeToMinutes } from "../lib/time";
-import { CURRENT_SUBJECTS_KEY, SCRAPED_SUBJECTS_KEY } from "../lib/constants";
+import { CURRENT_FILE_NAME_KEY, SCHEDULE_FILTERS_KEY } from "../lib/constants";
+import { loadCurrentSchedule, practicasSinSemanas, profesoresDeCarrera, tipoLabel } from "../lib/parseReport";
+import SemanasPendientes from "../components/SemanasPendientes";
 import { findProfessorConflicts } from "../lib/conflicts";
 import { tooltipPosition } from "../lib/tooltip";
 import { badgeStyle, BLOCK_COLORS, CONFLICT_COLOR, quincenaHatch } from "../lib/palette";
 import AppMark from "../components/AppMark";
 
 interface LocationState {
-    file?: File;
     profesor?: string;
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-function parseCSV(text: string): Subject[] {
-    const lines = text.trim().split("\n");
-    if (lines.length < 2) return [];
-
-    const headers = lines[0].split(",").map((h) => h.trim());
-
-    const rows: Subject[] = [];
-
-    for (let i = 1; i < lines.length; i++) {
-        const line = lines[i];
-        if (!line.trim()) continue;
-
-        // Handle quoted fields (e.g. "101, 102, 103")
-        const values: string[] = [];
-        let current = "";
-        let inQuotes = false;
-        for (const char of line) {
-            if (char === '"') {
-                inQuotes = !inQuotes;
-            } else if (char === "," && !inQuotes) {
-                values.push(current.trim());
-                current = "";
-            } else {
-                current += char;
-            }
-        }
-        values.push(current.trim());
-
-        const obj: Record<string, string> = {};
-        headers.forEach((h, idx) => {
-            obj[h] = values[idx] ?? "";
-        });
-
-        const s = new Subject();
-        s.codigo_materia = obj.codigo_materia ?? "";
-        s.materia = obj.materia ?? "";
-        s.tipo = obj.tipo ?? "";
-        s.paralelo = Number(obj.paralelo) || 0;
-        s.profesor = obj.profesor ?? "";
-        s.cupo_maximo = Number(obj.cupo_maximo) || 0;
-        s.cupo_disponible = Number(obj.cupo_disponible) || 0;
-        s.planificada_quincenalmente = obj.planificada_quincenalmente ?? "";
-        s.aula_examen_parcial = obj.aula_examen_parcial ?? "";
-        s.aula_examen_final = obj.aula_examen_final ?? "";
-        s.aula_mejoramiento = obj.aula_mejoramiento ?? "";
-        s.paralelos_asociados = obj.paralelos_asociados ?? "";
-        s.dia = obj.dia ?? "";
-        s.hora_inicio = obj.hora_inicio ?? "";
-        s.hora_fin = obj.hora_fin ?? "";
-        s.aula = obj.aula ?? "";
-        s.bloque = obj.bloque ?? "";
-        s.fecha_examen_parcial = obj.fecha_examen_parcial ?? "";
-        s.inicio_examen_parcial = obj.inicio_examen_parcial ?? "";
-        s.fin_examen_parcial = obj.fin_examen_parcial ?? "";
-        s.fecha_examen_final = obj.fecha_examen_final ?? "";
-        s.inicio_examen_final = obj.inicio_examen_final ?? "";
-        s.fin_examen_final = obj.fin_examen_final ?? "";
-        s.fecha_examen_mejoramiento = obj.fecha_examen_mejoramiento ?? "";
-        s.inicio_examen_mejoramiento = obj.inicio_examen_mejoramiento ?? "";
-        s.fin_examen_mejoramiento = obj.fin_examen_mejoramiento ?? "";
-        s.nivel = obj.nivel ?? "";
-
-        rows.push(s);
-    }
-
-    return rows;
+interface ScheduleFilters {
+    tipo: string;
+    nivel: string;
+    profesor: string;
 }
 
 const DAY_LABELS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes"];
@@ -110,59 +47,70 @@ export default function Schedule() {
     const navigate = useNavigate();
     const location = useLocation();
     const state = location.state as LocationState | null;
-    const file = state?.file;
 
+    // Clases de la carrera, y todas las del reporte (para el horario completo de un profesor).
     const [subjects, setSubjects] = useState<Subject[]>([]);
-    const [source, setSource] = useState<"extension" | "file" | "saved" | null>(null);
-    const [filterProfesor, setFilterProfesor] = useState<string>(state?.profesor ?? "ALL");
+    const [allSubjects, setAllSubjects] = useState<Subject[]>([]);
+    const [fileName, setFileName] = useState("");
+    const [filterProfesor, setFilterProfesor] = useState<string>("ALL");
     const [filterNivel, setFilterNivel] = useState<string>("ALL");
     const [filterTipo, setFilterTipo] = useState<string>("ALL");
+    // Los filtros se guardan solo después de restaurarlos, para no pisar los guardados.
+    const [filtersReady, setFiltersReady] = useState(false);
     const [tooltip, setTooltip] = useState<TooltipInfo | null>(null);
+
+    // Profesor con el que se llega desde Cruces (o undefined).
+    const profesorInicial = state?.profesor;
 
     useEffect(() => {
         let cancelled = false;
 
-        // Si la extensión acaba de extraer datos, ya están listos en storage — no
-        // dependemos de ningún archivo ni servidor.
-        getStorageItem<Subject[] | null>(SCRAPED_SUBJECTS_KEY, null).then((stored) => {
+        Promise.all([
+            loadCurrentSchedule(),
+            getStorageItem(CURRENT_FILE_NAME_KEY, ""),
+            getStorageItem<ScheduleFilters | null>(SCHEDULE_FILTERS_KEY, null),
+        ]).then(([loaded, name, saved]) => {
             if (cancelled) return;
-            if (stored && stored.length > 0) {
-                setSubjects(stored);
-                setSource("extension");
-                setStorageItem(CURRENT_SUBJECTS_KEY, stored);
+            if (loaded.carrera.length === 0) {
+                // Sin archivo cargado, o ninguna materia del archivo está en la malla.
+                navigate("/");
                 return;
             }
+            setSubjects(loaded.carrera);
+            setAllSubjects(loaded.todas);
+            setFileName(name);
 
-            if (!file) {
-                // Sin archivo nuevo (p. ej. al volver desde Cruces): reusar el último
-                // horario cargado en vez de mandar al usuario a subirlo otra vez.
-                getStorageItem<Subject[]>(CURRENT_SUBJECTS_KEY, []).then((current) => {
-                    if (cancelled) return;
-                    if (current.length === 0) {
-                        navigate("/");
-                        return;
-                    }
-                    setSubjects(current);
-                    setSource("saved");
-                });
-                return;
+            // Filtros: si se llega desde Cruces con un profesor, se muestra todo su horario.
+            // Si no, se restauran los últimos usados (si siguen existiendo en este archivo)
+            // o se arranca con el primer nivel, porque todos juntos no se alcanzan a leer.
+            const niveles = Array.from(new Set(loaded.carrera.map((s) => s.nivel))).sort();
+            const profesores = new Set(loaded.carrera.map((s) => s.profesor));
+            if (profesorInicial) {
+                setFilterProfesor(profesorInicial);
+            } else {
+                setFilterTipo(saved?.tipo ?? "ALL");
+                setFilterNivel(saved && (saved.nivel === "ALL" || niveles.includes(saved.nivel)) ? saved.nivel : niveles[0] ?? "ALL");
+                setFilterProfesor(saved && profesores.has(saved.profesor) ? saved.profesor : "ALL");
             }
-
-            const reader = new FileReader();
-            reader.onload = (e) => {
-                const text = e.target?.result as string;
-                const parsed = parseCSV(text);
-                setSubjects(parsed);
-                setSource("file");
-                setStorageItem(CURRENT_SUBJECTS_KEY, parsed);
-            };
-            reader.readAsText(file, "UTF-8");
+            setFiltersReady(true);
         });
 
         return () => {
             cancelled = true;
         };
-    }, []);
+    }, [navigate, profesorInicial]);
+
+    // Al elegir un profesor se muestran todos sus niveles: su horario completo es lo que
+    // interesa para revisar sus cruces.
+    function selectProfesor(p: string) {
+        setFilterProfesor(p);
+        if (p !== "ALL") setFilterNivel("ALL");
+    }
+
+    useEffect(() => {
+        if (!filtersReady) return;
+        setStorageItem<ScheduleFilters>(SCHEDULE_FILTERS_KEY, { tipo: filterTipo, nivel: filterNivel, profesor: filterProfesor });
+    }, [filtersReady, filterTipo, filterNivel, filterProfesor]);
 
     // Unique professors sorted alphabetically
     const professors = useMemo(() => {
@@ -189,27 +137,37 @@ export default function Schedule() {
         return map;
     }, [professors]);
 
+    // Con un profesor elegido se muestran todas sus clases, también las de otras carreras,
+    // para que se vean sus cruces completos.
     const filteredSubjects = useMemo(() => {
-        return subjects.filter((s) => {
+        const source = filterProfesor === "ALL" ? subjects : allSubjects;
+        return source.filter((s) => {
             const matchProfesor = filterProfesor === "ALL" || s.profesor === filterProfesor;
             const matchNivel = filterNivel === "ALL" || s.nivel === filterNivel;
             const matchTipo = filterTipo === "ALL" || s.tipo === filterTipo;
             return matchProfesor && matchNivel && matchTipo;
         });
-    }, [subjects, filterProfesor, filterNivel, filterTipo]);
+    }, [subjects, allSubjects, filterProfesor, filterNivel, filterTipo]);
 
     // Filas involucradas en un cruce de horario del mismo profesor (sobre TODAS las
     // materias, sin importar los filtros activos, para que el chequeo sea completo).
+    const professorConflicts = useMemo(
+        () => findProfessorConflicts(allSubjects, profesoresDeCarrera(subjects)),
+        [subjects, allSubjects]
+    );
+    const conflictCount = professorConflicts.reduce((n, g) => n + g.conflicts.length, 0);
+    const pendientes = useMemo(() => practicasSinSemanas(subjects), [subjects]);
+    const nombres = useMemo(() => Object.fromEntries(subjects.map((s) => [s.codigo_materia, s.materia])), [subjects]);
     const conflictedRows = useMemo(() => {
         const set = new Set<Subject>();
-        for (const group of findProfessorConflicts(subjects)) {
+        for (const group of professorConflicts) {
             for (const pair of group.conflicts) {
                 set.add(pair.a.meeting.row);
                 set.add(pair.b.meeting.row);
             }
         }
         return set;
-    }, [subjects]);
+    }, [professorConflicts]);
 
     // Group subjects by day
     const byDay = useMemo(() => {
@@ -256,15 +214,10 @@ export default function Schedule() {
 
     const stats = [
         { label: "clases", value: filteredSubjects.length },
-        { label: "profesores", value: professors.length - 1 },
+        { label: "profesores", value: new Set(filteredSubjects.map((s) => s.profesor).filter(Boolean)).size },
         { label: "materias", value: new Set(filteredSubjects.map((s) => s.codigo_materia)).size },
         { label: "aulas", value: new Set(filteredSubjects.map((s) => s.aula).filter(Boolean)).size },
     ];
-
-    const tooltipQuincena = (() => {
-        const pq = tooltip?.subject.planificada_quincenalmente?.trim().toUpperCase() ?? "";
-        return pq === "1 QUINCENA" ? "1ª Quincena" : pq === "2 QUINCENA" ? "2ª Quincena" : null;
-    })();
 
     return (
         <div id="schedule-page" className="page" style={{ paddingBottom: 40 }}>
@@ -289,7 +242,7 @@ export default function Schedule() {
                     <div style={{ minWidth: 0 }}>
                         <h1 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Visualizador de Horarios</h1>
                         <p style={{ margin: 0, fontSize: 12, color: "var(--text-3)" }}>
-                            ESPOL · {source === "extension" ? "extraído automáticamente" : source === "saved" ? "último horario cargado" : file?.name}
+                            ESPOL · {fileName || "último horario cargado"}
                         </p>
                     </div>
                 </div>
@@ -297,16 +250,32 @@ export default function Schedule() {
                 <nav style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                     <button id="btn-conflicts" className="btn" onClick={() => navigate("/conflicts")}>
                         Cruces
-                        {conflictedRows.size > 0 && <span className="btn-badge">{conflictedRows.size}</span>}
+                        {conflictCount > 0 && (
+                            <span className="btn-badge" title={`${conflictCount} ${conflictCount === 1 ? "cruce" : "cruces"} entre profesores`}>
+                                {conflictCount}
+                            </span>
+                        )}
                     </button>
-                    <button id="btn-config" className="btn" onClick={() => navigate("/config")}>
-                        Niveles
+                    <button
+                        id="btn-config"
+                        className="btn"
+                        onClick={() => navigate("/config", pendientes.length > 0 ? { state: { seccion: "semanas" } } : undefined)}
+                        title={pendientes.length > 0 ? `Falta indicar las semanas de las prácticas de ${pendientes.length} materias` : undefined}
+                    >
+                        Configuración
+                        {pendientes.length > 0 && <span className="btn-badge btn-badge-warning">{pendientes.length}</span>}
                     </button>
                     <button id="btn-back" className="btn btn-ghost" onClick={() => navigate("/")}>
                         Cargar otro archivo
                     </button>
                 </nav>
             </header>
+
+            {pendientes.length > 0 && (
+                <div style={{ padding: "16px 24px 0" }}>
+                    <SemanasPendientes codigos={pendientes} nombres={nombres} />
+                </div>
+            )}
 
             {/* ── Filtros + resumen ── */}
             <div
@@ -322,8 +291,12 @@ export default function Schedule() {
                 <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
                     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                         <span className="field-label">Tipo</span>
-                        <SearchableSelect
-                            options={["TEORIA", "PRACTICO"]}
+                        <FilterSelect
+                            label="Tipo"
+                            options={[
+                                { value: "TEORIA", label: "Teoría" },
+                                { value: "PRACTICO", label: "Práctica" },
+                            ]}
                             value={filterTipo}
                             onChange={setFilterTipo}
                             allLabel="Todos los tipos"
@@ -332,8 +305,9 @@ export default function Schedule() {
                     </div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                         <span className="field-label">Nivel</span>
-                        <SearchableSelect
-                            options={niveles.filter((n) => n !== "ALL")}
+                        <FilterSelect
+                            label="Nivel"
+                            options={niveles.filter((n) => n !== "ALL").map((n) => ({ value: n, label: n }))}
                             value={filterNivel}
                             onChange={setFilterNivel}
                             allLabel="Todos los niveles"
@@ -342,10 +316,11 @@ export default function Schedule() {
                     </div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                         <span className="field-label">Profesor</span>
-                        <SearchableSelect
-                            options={professors.filter((p) => p !== "ALL")}
+                        <FilterSelect
+                            label="Profesor"
+                            options={professors.filter((p) => p !== "ALL").map((p) => ({ value: p, label: p }))}
                             value={filterProfesor}
-                            onChange={setFilterProfesor}
+                            onChange={selectProfesor}
                             allLabel="Todos los profesores"
                             width={280}
                         />
@@ -606,7 +581,7 @@ export default function Schedule() {
                                                                     ...badgeStyle(isTEORIA, quincena),
                                                                 }}
                                                             >
-                                                                {isTEORIA ? "TEO" : quincena ? `PRA · Q${quincena}` : "PRA"}
+                                                                {isTEORIA ? "TEO" : quincena === 1 ? "PRA · IMPAR" : quincena === 2 ? "PRA · PAR" : "PRA"}
                                                             </span>
                                                         )}
                                                     </div>
@@ -676,7 +651,7 @@ export default function Schedule() {
                                             key={p}
                                             className="btn btn-ghost"
                                             style={{ height: 26, padding: "0 8px", fontSize: 12 }}
-                                            onClick={() => setFilterProfesor(p)}
+                                            onClick={() => selectProfesor(p)}
                                         >
                                             <span
                                                 style={{
@@ -704,14 +679,12 @@ export default function Schedule() {
                         <tbody>
                             {[
                                 ["Código", tooltip.subject.codigo_materia],
-                                ["Tipo", tooltip.subject.tipo],
+                                ["Tipo", tipoLabel(tooltip.subject)],
                                 ["Paralelo", tooltip.subject.paralelo],
                                 ["Profesor", tooltip.subject.profesor],
                                 ["Horario", `${tooltip.subject.hora_inicio.slice(0, 5)} – ${tooltip.subject.hora_fin.slice(0, 5)}`],
-                                ["Aula", `${tooltip.subject.aula} · ${tooltip.subject.bloque}`],
-                                ["Cupo", `${tooltip.subject.cupo_disponible} / ${tooltip.subject.cupo_maximo}`],
-                                ["Nivel", tooltip.subject.nivel],
-                                ...(tooltipQuincena ? [["Quincena", tooltipQuincena]] : []),
+                                ["Aula", [tooltip.subject.aula, tooltip.subject.bloque].filter(Boolean).join(" · ")],
+                                ["Nivel", tooltip.subject.nivel || "Otra carrera"],
                             ].map(([label, val]) => (
                                 <tr key={String(label)}>
                                     <td>{label}</td>

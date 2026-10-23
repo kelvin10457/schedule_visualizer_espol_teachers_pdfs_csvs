@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Reportes y tablas reales de la coordinación: se usan en local, no se suben al repositorio
+public/new_data/
