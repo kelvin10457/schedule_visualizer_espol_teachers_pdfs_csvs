@@ -16,8 +16,7 @@ export interface Section {
     profesor: string;
     nivel: string;
     // Números de paralelo de práctica ligados a esta sección (solo relevante en TEORIA;
-    // viene del campo "paralelos_asociados" que main.py copia igual en todas las filas
-    // de un mismo paralelo de teoría).
+    // viene del campo "paralelos_asociados" que arma applyConfig en src/lib/parseReport.ts).
     paralelosAsociados: number[];
     meetings: Meeting[];
 }
@@ -60,6 +59,7 @@ export function quincenaOf(row: Subject): Quincena {
 // Dos reuniones solo compiten por el mismo horario real si hay al menos una semana en
 // que ambas ocurren. Si una es quincenal, igual "TODAS" cae en esa semana → si compiten.
 // Solo quedan libres de cruce el par "1 QUINCENA" vs "2 QUINCENA" (semanas alternas).
+// Las prácticas sin semanas indicadas cuentan como de todas las semanas: no se asume nada.
 function quincenasCompatible(a: Subject, b: Subject): boolean {
     const qa = quincenaOf(a);
     const qb = quincenaOf(b);
@@ -174,11 +174,12 @@ export function optionsConflict(a: SubjectOption, b: SubjectOption): boolean {
 }
 
 // Cruces reales de horario de cada profesor (dos secciones distintas que le chocan).
-export function findProfessorConflicts(subjects: Subject[]): ProfessorConflictGroup[] {
+// Con "profesores" se limita a esas personas, pero revisando todas sus clases.
+export function findProfessorConflicts(subjects: Subject[], profesores?: Set<string>): ProfessorConflictGroup[] {
     const sections = buildSections(subjects);
     const byProfesor = new Map<string, Section[]>();
     for (const sec of sections) {
-        if (!sec.profesor) continue;
+        if (!sec.profesor || (profesores && !profesores.has(sec.profesor))) continue;
         if (!byProfesor.has(sec.profesor)) byProfesor.set(sec.profesor, []);
         byProfesor.get(sec.profesor)!.push(sec);
     }
@@ -205,6 +206,13 @@ export function findProfessorConflicts(subjects: Subject[]): ProfessorConflictGr
         if (conflicts.length > 0) groups.push({ profesor, conflicts });
     }
     return groups.sort((a, b) => b.conflicts.length - a.conflicts.length);
+}
+
+// Si un cruce es entre clases de la misma aula, o se dictan en semanas alternas y falta
+// indicarlo, o hay un error de planificación. La herramienta no decide cuál: solo lo avisa.
+export function mismaAulaYHora(c: ConflictPair): boolean {
+    const a = c.a.meeting.row.aula;
+    return !!a && a === c.b.meeting.row.aula;
 }
 
 // Para cada par de materias del nivel, ¿existe al menos una combinación de paralelos sin

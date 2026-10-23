@@ -1,32 +1,35 @@
 import { useState, useRef, type ChangeEvent, type DragEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import AppMark from "../components/AppMark";
+import { parseReportCSV, loadCurrentSchedule } from "../lib/parseReport";
+import { setStorageItem } from "../lib/storage";
+import { CURRENT_FILE_NAME_KEY, CURRENT_SUBJECTS_KEY } from "../lib/constants";
 
 export default function UploadFile() {
     const [csvFile, setCsvFile] = useState<File | null>(null);
     const [dragging, setDragging] = useState(false);
+    const [error, setError] = useState<string | null>(null);
     const inputRef = useRef<HTMLInputElement>(null);
     const navigate = useNavigate();
 
-    function handleChange(e: ChangeEvent<HTMLInputElement>) {
-        const file = e.target.files?.[0];
-        if (file && file.name.endsWith(".csv")) {
+    function selectFile(file: File | undefined) {
+        setError(null);
+        if (file && file.name.toLowerCase().endsWith(".csv")) {
             setCsvFile(file);
-        } else {
-            alert("Ingrese un archivo .csv");
-            e.target.value = "";
+            return true;
         }
+        alert("Ingrese un archivo .csv");
+        return false;
+    }
+
+    function handleChange(e: ChangeEvent<HTMLInputElement>) {
+        if (!selectFile(e.target.files?.[0])) e.target.value = "";
     }
 
     function handleDrop(e: DragEvent<HTMLDivElement>) {
         e.preventDefault();
         setDragging(false);
-        const file = e.dataTransfer.files?.[0];
-        if (file && file.name.endsWith(".csv")) {
-            setCsvFile(file);
-        } else {
-            alert("Ingrese un archivo .csv");
-        }
+        selectFile(e.dataTransfer.files?.[0]);
     }
 
     function handleDragOver(e: DragEvent<HTMLDivElement>) {
@@ -38,10 +41,20 @@ export default function UploadFile() {
         setDragging(false);
     }
 
-    function handleContinue() {
-        if (csvFile) {
-            navigate("/show-schedule", { state: { file: csvFile } });
+    async function handleContinue() {
+        if (!csvFile) return;
+        const subjects = parseReportCSV(await csvFile.text());
+        if (subjects.length === 0) {
+            setError("El archivo no tiene el formato del reporte «Horario de clases por aula» o no contiene clases.");
+            return;
         }
+        await setStorageItem(CURRENT_SUBJECTS_KEY, subjects);
+        await setStorageItem(CURRENT_FILE_NAME_KEY, csvFile.name);
+        if ((await loadCurrentSchedule()).carrera.length === 0) {
+            setError("Ninguna materia del archivo está en la malla curricular. Revisa los códigos en Configurar materias.");
+            return;
+        }
+        navigate("/show-schedule");
     }
 
     return (
@@ -145,6 +158,10 @@ export default function UploadFile() {
                     />
                 </div>
 
+                {error && (
+                    <p style={{ margin: 0, fontSize: 13, color: "var(--danger)" }}>{error}</p>
+                )}
+
                 <button
                     id="btn-continue"
                     className="btn btn-primary btn-lg"
@@ -168,9 +185,9 @@ export default function UploadFile() {
                         color: "var(--text-3)",
                     }}
                 >
-                    <span>Solo archivos .csv generados por el sistema de ESPOL</span>
+                    <span>Reporte «Horario de clases por aula» (.csv) del sistema académico</span>
                     <Link to="/config" className="link-button" style={{ color: "var(--text-2)" }}>
-                        Configurar niveles
+                        Configurar materias
                     </Link>
                 </div>
             </div>

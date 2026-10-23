@@ -1,8 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import Subject from "../models/Subject";
 import { getStorageItem, setStorageItem } from "../lib/storage";
-import { CONFLICTS_SELECTION_KEY, CURRENT_SUBJECTS_KEY } from "../lib/constants";
+import { CONFLICTS_SELECTION_KEY } from "../lib/constants";
+import {
+    loadCurrentSchedule,
+    practicasSinSemanas,
+    profesoresDeCarrera,
+    semanasLabel,
+    type LoadedSchedule,
+    type RelacionMateria,
+    type RelacionPracticas,
+} from "../lib/parseReport";
 import {
     buildSections,
     buildSubjectOptions,
@@ -11,19 +20,23 @@ import {
     findConflictFreeCombo,
     findProfessorConflicts,
     meetingsOverlap,
+    mismaAulaYHora,
+    type ConflictPair,
     optionsConflict,
     pairwiseFeasibility,
     type FreeKind,
     type SubjectOption,
 } from "../lib/conflicts";
-import Combobox from "../components/Combobox";
+import { NOMBRES_MATERIAS } from "../lib/mallaCurricular";
+import { downloadExcel } from "../lib/exportExcel";
 import MiniWeekGrid, { type WeekBlock } from "../components/MiniWeekGrid";
+import SemanasPendientes from "../components/SemanasPendientes";
 import { BLOCK_COLORS } from "../lib/palette";
 
 const FREE_KIND_LEGEND: { kind: FreeKind; label: string; bg: string; border: string }[] = [
     { kind: "TODAS", label: "Libre todas las semanas", bg: "rgba(30,122,76,0.10)", border: "rgba(30,122,76,0.5)" },
-    { kind: "1", label: "Libre en 1ª quincena", bg: "rgba(154,101,18,0.10)", border: "rgba(154,101,18,0.5)" },
-    { kind: "2", label: "Libre en 2ª quincena", bg: "rgba(101,71,154,0.10)", border: "rgba(101,71,154,0.5)" },
+    { kind: "1", label: "Libre solo en semanas impares", bg: "rgba(154,101,18,0.10)", border: "rgba(154,101,18,0.5)" },
+    { kind: "2", label: "Libre solo en semanas pares", bg: "rgba(101,71,154,0.10)", border: "rgba(101,71,154,0.5)" },
 ];
 
 interface SavedSelection {
@@ -37,15 +50,90 @@ function optionKey(opt: SubjectOption): string {
     return `${opt.teoria.tipo}${opt.teoria.paralelo}|${opt.practica?.paralelo ?? ""}`;
 }
 
-function optionLabel(opt: SubjectOption): string {
-    const teoriaPart = `Teoría P${opt.teoria.paralelo} — ${opt.teoria.profesor}`;
-    if (!opt.practica) return teoriaPart;
-    return `${teoriaPart}  +  Práctica ${opt.practica.paralelo} — ${opt.practica.profesor}`;
+const RELACION_NOTA: Record<RelacionPracticas, string> = {
+    cualquiera: "Con cualquier teoría se puede tomar cualquier práctica de la materia",
+    emparejadas: "Cada teoría solo con su práctica (1→101, 2→102…)",
+};
+
+// Elige la opción de una materia con dos listas: teoría y práctica. La lista de prácticas
+// solo muestra las que se pueden tomar con la teoría elegida.
+function SubjectPicker({
+    opts,
+    current,
+    conflicted,
+    relacion,
+    onChange,
+}: {
+    opts: SubjectOption[];
+    current: SubjectOption | undefined;
+    conflicted: boolean;
+    relacion: RelacionMateria | undefined;
+    onChange: (opt: SubjectOption) => void;
+}) {
+    const selected = current ?? opts[0];
+    const teorias = Array.from(new Set(opts.map((o) => o.teoria))).sort((a, b) => a.paralelo - b.paralelo);
+    const practicas = opts
+        .filter((o) => o.teoria === selected?.teoria && o.practica)
+        .sort((a, b) => a.practica!.paralelo - b.practica!.paralelo);
+    const className = conflicted ? "input is-danger" : "input";
+
+    function pickTeoria(paralelo: number) {
+        const conTeoria = opts.filter((o) => o.teoria.paralelo === paralelo);
+        // Si la misma práctica sirve con la nueva teoría, se conserva.
+        const next = conTeoria.find((o) => o.practica?.paralelo === selected?.practica?.paralelo) ?? conTeoria[0];
+        if (next) onChange(next);
+    }
+
+    function pickPractica(paralelo: number) {
+        const next = practicas.find((o) => o.practica!.paralelo === paralelo);
+        if (next) onChange(next);
+    }
+
+    return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0 }}>
+            <div style={{ display: "grid", gridTemplateColumns: practicas.length > 0 ? "1fr 1fr" : "1fr", gap: 8 }}>
+                <select
+                    className={className}
+                    aria-label="Paralelo de teoría"
+                    value={selected?.teoria.paralelo}
+                    onChange={(e) => pickTeoria(Number(e.target.value))}
+                >
+                    {teorias.map((t) => (
+                        <option key={t.paralelo} value={t.paralelo}>
+                            {t.tipo === "TEORIA" ? "Teoría" : "Práctica"} P{t.paralelo} — {t.profesor}
+                        </option>
+                    ))}
+                </select>
+                {practicas.length > 0 && (
+                    <select
+                        className={className}
+                        aria-label="Paralelo de práctica"
+                        value={selected?.practica?.paralelo}
+                        onChange={(e) => pickPractica(Number(e.target.value))}
+                        disabled={practicas.length === 1}
+                    >
+                        {practicas.map((o) => (
+                            <option key={o.practica!.paralelo} value={o.practica!.paralelo}>
+                                Práctica {o.practica!.paralelo} — {o.practica!.profesor}
+                            </option>
+                        ))}
+                    </select>
+                )}
+            </div>
+            {relacion && (
+                <span style={{ fontSize: 11, color: "var(--text-3)" }}>
+                    {RELACION_NOTA[relacion.modo]}
+                    {relacion.manual ? " · elegido en Configuración" : " · detectado automáticamente"}
+                </span>
+            )}
+        </div>
+    );
 }
 
 export default function Conflicts() {
     const navigate = useNavigate();
-    const [subjects, setSubjects] = useState<Subject[] | null>(null);
+    const [schedule, setSchedule] = useState<LoadedSchedule | null>(null);
+    const subjects = schedule?.carrera ?? null;
     const [selectedNivel, setSelectedNivel] = useState("");
     const [selection, setSelection] = useState<Record<string, SubjectOption>>({});
     const [autoResult, setAutoResult] = useState<
@@ -58,27 +146,52 @@ export default function Conflicts() {
         | { status: "ready"; combos: SubjectOption[][]; truncated: boolean; index: number }
     >({ status: "idle" });
 
-    const pendingRestore = useRef<SavedSelection | null>(null);
+    // Cambia de nivel: arranca con la primera opción de cada materia y limpia el resultado
+    // de la búsqueda automática anterior. Si hay una selección guardada para ese nivel
+    // (venimos de recargar la página), se restaura; los paralelos que ya no existan en el
+    // horario actual caen a la primera opción.
+    function chooseNivel(nivel: string, carrera: Subject[], saved: SavedSelection | null = null) {
+        const options = buildSubjectOptions(buildSections(carrera.filter((s) => s.nivel === nivel)));
+        const initial: Record<string, SubjectOption> = {};
+        for (const [code, opts] of options) {
+            if (opts.length === 0) continue;
+            const savedKey = saved?.nivel === nivel ? saved.picks[code] : undefined;
+            initial[code] = (savedKey && opts.find((o) => optionKey(o) === savedKey)) || opts[0];
+        }
+        setSelectedNivel(nivel);
+        setSelection(initial);
+        setAutoResult({ status: "idle" });
+        setCombosState({ status: "idle" });
+    }
 
     useEffect(() => {
         Promise.all([
-            getStorageItem<Subject[]>(CURRENT_SUBJECTS_KEY, []),
+            loadCurrentSchedule(),
             getStorageItem<SavedSelection | null>(CONFLICTS_SELECTION_KEY, null),
         ]).then(([loaded, saved]) => {
-            setSubjects(loaded);
-            if (saved && loaded.some((s) => s.nivel === saved.nivel)) {
-                pendingRestore.current = saved;
-                setSelectedNivel(saved.nivel);
+            setSchedule(loaded);
+            if (saved && Object.values(loaded.malla).includes(saved.nivel)) {
+                chooseNivel(saved.nivel, loaded.carrera, saved);
+            } else {
+                // Sin selección guardada, se arranca con el primer nivel que tenga clases.
+                const niveles = Array.from(new Set(loaded.carrera.map((s) => s.nivel))).sort();
+                if (niveles[0]) chooseNivel(niveles[0], loaded.carrera);
             }
         });
     }, []);
 
-    const professorConflicts = useMemo(() => (subjects ? findProfessorConflicts(subjects) : []), [subjects]);
+    // Profesores de la carrera, revisando todas sus clases del reporte (también las de otras
+    // carreras): si dictan otra materia a la misma hora, igual es un cruce.
+    const professorConflicts = useMemo(
+        () => (schedule ? findProfessorConflicts(schedule.todas, profesoresDeCarrera(schedule.carrera)) : []),
+        [schedule]
+    );
 
-    const niveles = useMemo(() => {
-        if (!subjects) return [];
-        return Array.from(new Set(subjects.map((s) => s.nivel).filter(Boolean))).sort();
-    }, [subjects]);
+    const pendientes = useMemo(() => practicasSinSemanas(subjects ?? []), [subjects]);
+    const nombres = useMemo(() => Object.fromEntries((schedule?.todas ?? []).map((s) => [s.codigo_materia, s.materia])), [schedule]);
+
+    // Todos los niveles de la malla, tengan o no materias con horario en el archivo.
+    const niveles = useMemo(() => (schedule ? Array.from(new Set(Object.values(schedule.malla))).sort() : []), [schedule]);
 
     const optionsByCodigo = useMemo(() => {
         if (!subjects || !selectedNivel) return new Map<string, SubjectOption[]>();
@@ -88,6 +201,16 @@ export default function Conflicts() {
 
     const codes = useMemo(() => Array.from(optionsByCodigo.keys()).sort(), [optionsByCodigo]);
 
+    // Materias del nivel según la malla que el archivo no trae. No entran en el análisis
+    // porque no tienen horario.
+    const missingCodes = useMemo(() => {
+        if (!schedule || !selectedNivel) return [];
+        return Object.entries(schedule.malla)
+            .filter(([codigo, nivel]) => nivel === selectedNivel && !optionsByCodigo.has(codigo))
+            .map(([codigo]) => codigo)
+            .sort();
+    }, [schedule, selectedNivel, optionsByCodigo]);
+
     // Secciones crudas del nivel (todas las materias, tipos y paralelos) — se usan para
     // detectar los huecos libres, independientemente de qué opción esté seleccionada.
     const levelSections = useMemo(() => {
@@ -96,26 +219,6 @@ export default function Conflicts() {
     }, [subjects, selectedNivel]);
 
     const freeBlocks = useMemo(() => computeFreeBlocks(levelSections), [levelSections]);
-
-    // Al cambiar de nivel, arranca con la primera opción de cada materia y limpia el
-    // resultado de la búsqueda automática anterior.
-    // Si hay una selección guardada para este nivel (venimos de recargar la página), se
-    // restaura; los paralelos que ya no existan en el horario actual caen a la primera opción.
-    useEffect(() => {
-        const saved = pendingRestore.current?.nivel === selectedNivel ? pendingRestore.current : null;
-        pendingRestore.current = null;
-        const initial: Record<string, SubjectOption> = {};
-        for (const code of codes) {
-            const opts = optionsByCodigo.get(code);
-            if (!opts || opts.length === 0) continue;
-            const savedKey = saved?.picks[code];
-            initial[code] = (savedKey && opts.find((o) => optionKey(o) === savedKey)) || opts[0];
-        }
-        setSelection(initial);
-        setAutoResult({ status: "idle" });
-        setCombosState({ status: "idle" });
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [selectedNivel]);
 
     useEffect(() => {
         if (!selectedNivel || Object.keys(selection).length === 0) return;
@@ -267,16 +370,31 @@ export default function Conflicts() {
             <div style={{ maxWidth: 880, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16 }}>
                     <h1 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>Cruces de horario</h1>
-                    <button className="btn" onClick={() => navigate(-1)}>
-                        Volver
-                    </button>
+                    <div style={{ display: "flex", gap: 8 }}>
+                        <button className="btn" onClick={() => navigate("/config", pendientes.length > 0 ? { state: { seccion: "semanas" } } : undefined)}>
+                            Configuración
+                            {pendientes.length > 0 && <span className="btn-badge btn-badge-warning">{pendientes.length}</span>}
+                        </button>
+                        <button className="btn" onClick={() => navigate(-1)}>
+                            Volver
+                        </button>
+                    </div>
                 </div>
+
+                <SemanasPendientes codigos={pendientes} nombres={nombres} />
 
                 {/* ── Cruces de profesores ── */}
                 <section className="card" style={{ padding: 20 }}>
-                    <h2 className="section-title">Cruces entre profesores</h2>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+                        <h2 className="section-title">Cruces entre profesores</h2>
+                        {professorConflicts.length > 0 && (
+                            <button className="btn" onClick={() => exportConflicts(professorConflicts)} title="Descargar la lista de cruces como archivo de Excel">
+                                Descargar Excel
+                            </button>
+                        )}
+                    </div>
                     <p className="section-desc" style={{ marginBottom: 16 }}>
-                        Profesores con dos clases distintas que caen en el mismo día y horario. Haz clic en un nombre para ver su horario.
+                        Profesores de la carrera con dos clases distintas que caen en el mismo día y horario, contando también las que dictan en otras carreras. Haz clic en un nombre para ver su horario.
                     </p>
 
                     {professorConflicts.length === 0 ? (
@@ -301,13 +419,17 @@ export default function Conflicts() {
                                             {group.conflicts.length} {group.conflicts.length === 1 ? "cruce" : "cruces"}
                                         </span>
                                     </div>
-                                    <div className="tabular" style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                                    <div className="tabular" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                                         {group.conflicts.map((c, i) => (
                                             <div key={i} style={{ fontSize: 12, color: "var(--text-2)", lineHeight: 1.5 }}>
-                                                <b style={{ color: "var(--text)", fontWeight: 600 }}>{c.a.section.codigoMateria}</b> ({c.a.section.tipo === "TEORIA" ? "Teoría" : "Práctica"} P{c.a.section.paralelo}, {c.a.meeting.dia}{" "}
-                                                {formatRange(c.a.meeting.startMin, c.a.meeting.endMin)})
-                                                <span style={{ color: "var(--text-3)" }}>{" se cruza con "}</span>
-                                                <b style={{ color: "var(--text)", fontWeight: 600 }}>{c.b.section.codigoMateria}</b> ({c.b.section.tipo === "TEORIA" ? "Teoría" : "Práctica"} P{c.b.section.paralelo}, {c.b.meeting.dia} {formatRange(c.b.meeting.startMin, c.b.meeting.endMin)})
+                                                <div>
+                                                    <ClassRef side={c.a} />
+                                                </div>
+                                                <div>
+                                                    <span style={{ color: "var(--text-3)" }}>se cruza con </span>
+                                                    <ClassRef side={c.b} />
+                                                </div>
+                                                <ConflictHint conflict={c} onConfigure={() => navigate("/config", { state: { seccion: "semanas" } })} />
                                             </div>
                                         ))}
                                     </div>
@@ -325,7 +447,20 @@ export default function Conflicts() {
                     </p>
 
                     <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                        <Combobox options={niveles} value={selectedNivel} onChange={setSelectedNivel} placeholder="Elige un nivel..." width={260} />
+                        <select
+                            className="input"
+                            aria-label="Nivel"
+                            value={selectedNivel}
+                            onChange={(e) => chooseNivel(e.target.value, subjects ?? [])}
+                            style={{ width: 260 }}
+                        >
+                            {!selectedNivel && <option value="">Elige un nivel...</option>}
+                            {niveles.map((n) => (
+                                <option key={n} value={n}>
+                                    {n}
+                                </option>
+                            ))}
+                        </select>
                         <button className="btn btn-primary" onClick={handleAutoSearch} disabled={noLevel}>
                             Buscar combinación sin cruces
                         </button>
@@ -377,13 +512,25 @@ export default function Conflicts() {
                         </div>
                     )}
 
-                    {selectedNivel && codes.length === 0 && (
-                        <p style={{ fontSize: 13, color: "var(--text-2)", marginTop: 12, marginBottom: 0 }}>Este nivel no tiene materias con horario cargado.</p>
+                    {missingCodes.length > 0 && (
+                        <div className="callout callout-info" style={{ marginTop: 14, fontSize: 13 }}>
+                            {codes.length === 0
+                                ? "Ninguna materia de este nivel tiene horario en el archivo cargado"
+                                : `${missingCodes.length} ${missingCodes.length === 1 ? "materia" : "materias"} de este nivel no ${missingCodes.length === 1 ? "tiene" : "tienen"} horario en el archivo cargado y no se ${missingCodes.length === 1 ? "considera" : "consideran"} en el análisis`}
+                            :
+                            <ul style={{ margin: "6px 0 0", paddingLeft: 18, listStyle: "disc" }}>
+                                {missingCodes.map((c) => (
+                                    <li key={c}>
+                                        <strong style={{ fontWeight: 600 }}>{c}</strong> {NOMBRES_MATERIAS[c] ?? ""}
+                                    </li>
+                                ))}
+                            </ul>
+                        </div>
                     )}
 
                     {autoResult.status === "found" && (
                         <div className="callout callout-success" style={{ marginTop: 14 }}>
-                            <strong style={{ fontWeight: 600 }}>Sí es posible.</strong> Se armó una combinación sin cruces para las {autoResult.combo.length} materias de este nivel (aplicada abajo).
+                            <strong style={{ fontWeight: 600 }}>Sí es posible.</strong> Se armó una combinación sin cruces para las {autoResult.combo.length} materias de este nivel con horario (aplicada abajo).
                         </div>
                     )}
 
@@ -422,37 +569,37 @@ export default function Conflicts() {
                                             key={code}
                                             style={{
                                                 display: "grid",
-                                                gridTemplateColumns: "150px 1fr",
+                                                gridTemplateColumns: "200px 1fr",
                                                 gap: 12,
-                                                alignItems: "center",
+                                                alignItems: "start",
                                                 padding: "8px 12px",
                                                 borderTop: idx === 0 ? "none" : "1px solid var(--border)",
                                             }}
                                         >
-                                            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-                                                <span style={{ width: 8, height: 8, borderRadius: 2, background: color.border, flexShrink: 0 }} />
-                                                <span style={{ fontWeight: 600 }}>{code}</span>
-                                                {conflicted && (
-                                                    <span title="Se cruza con otra materia elegida" style={{ fontSize: 11, color: "var(--danger)", fontWeight: 500 }}>
-                                                        cruce
-                                                    </span>
-                                                )}
+                                            <div style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 13, paddingTop: 6 }}>
+                                                <span style={{ width: 8, height: 8, borderRadius: 2, background: color.border, flexShrink: 0, marginTop: 5 }} />
+                                                <div style={{ minWidth: 0 }}>
+                                                    <div>
+                                                        <span style={{ fontWeight: 600 }}>{code}</span>
+                                                        {conflicted && (
+                                                            <span title="Se cruza con otra materia elegida" style={{ marginLeft: 8, fontSize: 11, color: "var(--danger)", fontWeight: 500 }}>
+                                                                cruce
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    <div style={{ fontSize: 12, color: "var(--text-2)", lineHeight: 1.35 }}>{opts[0]?.materia ?? NOMBRES_MATERIAS[code]}</div>
+                                                </div>
                                             </div>
-                                            <select
-                                                className={conflicted ? "input is-danger" : "input"}
-                                                value={current ? opts.indexOf(current) : 0}
-                                                onChange={(e) => {
-                                                    const opt = opts[Number(e.target.value)];
-                                                    if (opt) setSelection((prev) => ({ ...prev, [code]: opt }));
+                                            <SubjectPicker
+                                                opts={opts}
+                                                current={current}
+                                                conflicted={conflicted}
+                                                relacion={schedule?.relaciones[code]}
+                                                onChange={(opt) => {
+                                                    setSelection((prev) => ({ ...prev, [code]: opt }));
                                                     setCombosState({ status: "idle" });
                                                 }}
-                                            >
-                                                {opts.map((opt, i) => (
-                                                    <option key={i} value={i}>
-                                                        {optionLabel(opt)}
-                                                    </option>
-                                                ))}
-                                            </select>
+                                            />
                                         </div>
                                     );
                                 })}
@@ -463,10 +610,12 @@ export default function Conflicts() {
                                     Huecos libres del nivel
                                 </div>
                                 <p style={{ margin: "0 0 10px", fontSize: 12, color: "var(--text-2)" }}>
-                                    Ningún paralelo de ninguna materia tiene clase ahí; es donde cabría abrir un paralelo nuevo.
+                                    Franjas donde ningún paralelo de ninguna materia del nivel tiene clase: ahí se podría abrir
+                                    un paralelo nuevo sin chocar con nada del nivel. Lo que puede inscribir un estudiante está
+                                    en las combinaciones de arriba.
                                 </p>
                                 <div style={{ display: "flex", flexWrap: "wrap", gap: "6px 16px" }}>
-                                    {FREE_KIND_LEGEND.map(({ kind, label, bg, border }) => (
+                                    {FREE_KIND_LEGEND.filter(({ kind }) => kind === "TODAS" || freeBlocks.some((f) => f.freeIn === kind)).map(({ kind, label, bg, border }) => (
                                         <div key={kind} style={{ display: "flex", alignItems: "center", gap: 6 }}>
                                             <span style={{ width: 12, height: 12, borderRadius: 2, background: bg, border: `1px dashed ${border}`, flexShrink: 0 }} />
                                             <span style={{ fontSize: 12, color: "var(--text-2)" }}>{label}</span>
@@ -496,7 +645,7 @@ export default function Conflicts() {
                                                         {dayFree.map((f, i) => (
                                                             <span key={i}>
                                                                 {formatRange(f.startMin, f.endMin)}
-                                                                {f.freeIn !== "TODAS" ? ` (${f.freeIn}ª quincena)` : ""}
+                                                                {f.freeIn === "1" ? " (semanas impares)" : f.freeIn === "2" ? " (semanas pares)" : ""}
                                                                 {i < dayFree.length - 1 ? " · " : ""}
                                                             </span>
                                                         ))}
@@ -512,6 +661,91 @@ export default function Conflicts() {
                 </section>
             </div>
         </div>
+    );
+}
+
+// Prácticas de un cruce que no tienen sus semanas indicadas, como "EYAG1040 práctica 111".
+function practicasSinSemanasEn(c: ConflictPair): string[] {
+    return [c.a, c.b]
+        .filter((x) => x.meeting.row.tipo === "PRACTICO" && x.meeting.row.planificada_quincenalmente === "DESCONOCIDA")
+        .map((x) => `${x.section.codigoMateria} práctica ${x.section.paralelo}`);
+}
+
+// Nota bajo un cruce cuando puede ser falso (faltan semanas) o cuando las dos clases usan
+// la misma aula a la vez. No se decide si es alternancia o un error: se avisa para revisar.
+function hintTexto(c: ConflictPair): { sinSemanas: string; mismaAula: string } {
+    const sin = practicasSinSemanasEn(c);
+    return {
+        sinSemanas:
+            sin.length > 0
+                ? `Puede no ser un cruce real: falta indicar en qué semanas se dicta ${sin.join(" y ")}. Si una es de semanas impares y la otra de pares, el cruce desaparece.`
+                : "",
+        mismaAula: mismaAulaYHora(c)
+            ? sin.length > 0
+                ? "Además usan la misma aula a la misma hora: o alternan semanas o hay un error de planificación."
+                : "Usan la misma aula a la misma hora en las mismas semanas: revisa la planificación o las semanas indicadas."
+            : "",
+    };
+}
+
+function ConflictHint({ conflict, onConfigure }: { conflict: ConflictPair; onConfigure: () => void }) {
+    const { sinSemanas, mismaAula } = hintTexto(conflict);
+    if (!sinSemanas && !mismaAula) return null;
+    return (
+        <div style={{ marginTop: 2, color: "var(--q1)" }}>
+            {[sinSemanas, mismaAula].filter(Boolean).join(" ")}{" "}
+            {sinSemanas && (
+                <button className="link-button" onClick={onConfigure} style={{ color: "var(--accent)" }}>
+                    Indicarlo en Configuración
+                </button>
+            )}
+        </div>
+    );
+}
+
+function claseLabel(side: ConflictPair["a"]): string {
+    const { section, meeting } = side;
+    const tipo = section.tipo === "TEORIA" ? `Teoría P${section.paralelo}` : `Práctica ${section.paralelo} (${semanasLabel(meeting.row)})`;
+    return `${tipo}, ${meeting.dia} ${formatRange(meeting.startMin, meeting.endMin)}, aula ${meeting.row.aula || "?"}`;
+}
+
+// Una clase dentro de un cruce: código, nombre, paralelo, horario y aula.
+function ClassRef({ side }: { side: ConflictPair["a"] }) {
+    const { section } = side;
+    return (
+        <>
+            <b style={{ color: "var(--text)", fontWeight: 600 }}>{section.codigoMateria}</b> {section.materia}
+            {section.nivel ? "" : " · otra carrera"} — {claseLabel(side)}
+        </>
+    );
+}
+
+function observacion(c: ConflictPair): string {
+    const { sinSemanas, mismaAula } = hintTexto(c);
+    return [sinSemanas, mismaAula].filter(Boolean).join(" ");
+}
+
+function exportConflicts(groups: ReturnType<typeof findProfessorConflicts>) {
+    const rows: string[][] = [];
+    for (const g of groups) {
+        for (const c of g.conflicts) {
+            rows.push([
+                g.profesor,
+                c.a.section.codigoMateria,
+                c.a.section.materia,
+                claseLabel(c.a),
+                c.b.section.codigoMateria,
+                c.b.section.materia,
+                claseLabel(c.b),
+                observacion(c),
+            ]);
+        }
+    }
+    downloadExcel(
+        "cruces-profesores.xlsx",
+        ["Profesor", "Código A", "Materia A", "Clase A", "Código B", "Materia B", "Clase B", "Observación"],
+        rows,
+        [34, 11, 32, 46, 11, 32, 46, 50]
     );
 }
 
